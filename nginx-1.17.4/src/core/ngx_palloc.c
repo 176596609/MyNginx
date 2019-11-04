@@ -37,12 +37,12 @@ ngx_create_pool(size_t size, ngx_log_t *log)
 	 * p->cleanup 存放可以被回调函数清理的内存块（该内存块不一定会在内存池上面分配）
      * https://blog.csdn.net/initphp/article/details/50588790  图片数据结构解析
 	 */
-    p->d.last = (u_char *) p + sizeof(ngx_pool_t);//内存开始地址，指向ngx_pool_t结构体之后数据取起始位置
-    p->d.end = (u_char *) p + size;//内存结束地址
+    p->d.last = (u_char *) p + sizeof(ngx_pool_t);//内存开始地址，指向ngx_pool_t结构体之后数据取起始位置 跳过结构体头就是可以使用的内存部分了
+    p->d.end = (u_char *) p + size;//内存结束地址   
     p->d.next = NULL;//下一个ngx_pool_t 内存池地
     p->d.failed = 0;//失败次数
 
-    size = size - sizeof(ngx_pool_t);
+    size = size - sizeof(ngx_pool_t);//大小是减去结构体头   
     p->max = (size < NGX_MAX_ALLOC_FROM_POOL) ? size : NGX_MAX_ALLOC_FROM_POOL;
 
     p->current = p;
@@ -111,18 +111,22 @@ ngx_destroy_pool(ngx_pool_t *pool)
 }
 
 
+/**
+ * 重设内存池
+ */
 void
 ngx_reset_pool(ngx_pool_t *pool)
 {
     ngx_pool_t        *p;
     ngx_pool_large_t  *l;
 
+    /* 清理pool->large链表（pool->large为单独的大数据内存块）  */
     for (l = pool->large; l; l = l->next) {
         if (l->alloc) {
             ngx_free(l->alloc);
         }
     }
-
+    /* 循环重新设置内存池data区域的 p->d.last；data区域数据并不擦除*/
     for (p = pool; p; p = p->d.next) {
         p->d.last = (u_char *) p + sizeof(ngx_pool_t);
         p->d.failed = 0;
@@ -137,6 +141,7 @@ ngx_reset_pool(ngx_pool_t *pool)
 void *
 ngx_palloc(ngx_pool_t *pool, size_t size)
 {
+    /* 判断每次分配的内存大小，如果超出pool->max的限制，则需要走大数据内存分配策略 */
 #if !(NGX_DEBUG_PALLOC)
     if (size <= pool->max) {
         return ngx_palloc_small(pool, size, 1);
