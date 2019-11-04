@@ -14,11 +14,11 @@
 
 
 typedef struct {
-    void        *elts;
-    ngx_uint_t   nelts;
-    size_t       size;
-    ngx_uint_t   nalloc;
-    ngx_pool_t  *pool;
+    void        *elts;/* 指向数组第一个元素指针*/
+    ngx_uint_t   nelts;//已经使用元素的索引
+    size_t       size;//每个元素的大小，元素大小是固定的。
+    ngx_uint_t   nalloc;//一共分配了多少个元素。如果元素不够用，Nginx会数组会进行自动扩容
+    ngx_pool_t  *pool;//数组的数据结构ngx_array_t和元素所需要的内存都会分配在pool内存池上
 } ngx_array_t;
 
 
