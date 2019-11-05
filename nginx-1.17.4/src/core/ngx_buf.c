@@ -57,7 +57,7 @@ ngx_alloc_chain_link(ngx_pool_t *pool)
     cl = pool->chain;
     /*
 	 * 首先从内存池中去取ngx_chain_t，
-	 * 被清空的ngx_chain_t结构都会放在pool->chain 缓冲链上
+	 * 被清空的ngx_chain_t结构都会放在pool->chain 缓冲链上  被释放的ngx_chain_t是通过ngx_free_chain添加到poll->chain上的
 	 */
     if (cl) {
         pool->chain = cl->next;
@@ -203,6 +203,14 @@ ngx_chain_get_free_buf(ngx_pool_t *p, ngx_chain_t **free)
 所以开始的时候需要判断将out应该放到哪一个位置，如果busy当前就存在的话，那么就应该将out放置到busy的最后，如果当前busy链表不存在，那么处理就是
 将其作为busy链表进行处理
 而后面的操作则是说明从头对busy链表实行检查，如果busy链表中的buf还存在需要处理的内存空间，那么就需要停止处理，否则就将其置为空（即对last和pos进行处理）
+将out链表插入到busy链表尾部，同时将合并后的链表从头开始的所有没有使用的节点，插入到空闲链表。
+合并链表后，out为null
+
+因为nginx可以提前flush输出，所以这些buf被输出后就可以重复使用，可以避免重分配，提高系统性能，被称为free_buf，而没有被输出的
+buf就是busy_buf。nginx没有特别的集成这个特性到自身，但是提供了一个函数ngx_chain_update_chains来帮助开发者维护这两个缓冲区队列
+
+该函数功能就是把新读到的out数据添加到busy表尾部，然后把busy表中已经处理完毕的buf节点从busy表中摘除，然后放到free表头部
+未发送出去的buf节点既会在out链表中，也会在busy链表中
 */
 void
 ngx_chain_update_chains(ngx_pool_t *p, ngx_chain_t **free, ngx_chain_t **busy,
@@ -210,36 +218,37 @@ ngx_chain_update_chains(ngx_pool_t *p, ngx_chain_t **free, ngx_chain_t **busy,
 {
     ngx_chain_t  *cl;
 
-    if (*out) {
-        if (*busy == NULL) {
-            *busy = *out;
+    if (*out) {//如果*out 不是NULL  
+        if (*busy == NULL) {//如果*busy==NULL
+            *busy = *out;  //*busy指向和 *out同样的链表
 
-        } else {
+        } else {//如果*busy不为空，那么找到*busy的最后一个节点  遍历直到cl指向最后一个节点
             for (cl = *busy; cl->next; cl = cl->next) { /* void */ }
 
-            cl->next = *out;
+            cl->next = *out;//把整个*out链表追加到cl节点后面  换句话说*out链表成为了*busy链表的一部分
         }
 
         *out = NULL;
     }
 
-    while (*busy) {
+    while (*busy) {//遍历整个*busy链表
         cl = *busy;
-
-        if (ngx_buf_size(cl->buf) != 0) {
+        //合并后的该busy链表节点有内容时，则表示剩余节点都有内容，则退出  ？？？其实没有读懂这  ngx_buf_size看起来是表示节点上还有多少空间可以利用
+        if (ngx_buf_size(cl->buf) != 0) {//如果还有人正在使用这个节点buf  那么跳出循环   pos==last意味着已经处理完了
             break;
         }
-
-        if (cl->buf->tag != tag) {
+        
+        if (cl->buf->tag != tag) { //缓冲区类型不同，直接释放   tag 中存储的是 函数指
             *busy = cl->next;
-            ngx_free_chain(p, cl);
+            ngx_free_chain(p, cl);//节点摘下来  节点转换到pool->chain链表上
             continue;
         }
-
+        //把该空间的pos last都指向start开始处，表示该ngx_buf_t没有数据在里面，因此可以把他加到free表中，可以继续读取数据到free中的ngx_buf_t节点了
         cl->buf->pos = cl->buf->start;
         cl->buf->last = cl->buf->start;
-
+        //继续遍历
         *busy = cl->next;
+        //将该空闲空闲区加入到free链表表头
         cl->next = *free;
         *free = cl;
     }
@@ -291,6 +300,7 @@ ngx_chain_coalesce_file(ngx_chain_t **in, off_t limit)
 }
 
 
+//计算本次掉用ngx_writev发送出去的send字节在in链表中所有数据的那个位置 in链表入口  sent是发送了的字节数
 ngx_chain_t *
 ngx_chain_update_sent(ngx_chain_t *in, off_t sent)
 {
@@ -298,32 +308,32 @@ ngx_chain_update_sent(ngx_chain_t *in, off_t sent)
 
     for ( /* void */ ; in; in = in->next) {
 
-        if (ngx_buf_special(in->buf)) {
+        if (ngx_buf_special(in->buf)) {//猜测只有发送的链表才处理 否则continue
             continue;
         }
 
-        if (sent == 0) {
+        if (sent == 0) {//已经找到发送的末尾了
             break;
         }
 
-        size = ngx_buf_size(in->buf);
+        size = ngx_buf_size(in->buf);//当前链表节点还没有发送的大小
 
-        if (sent >= size) {
-            sent -= size;
+        if (sent >= size) {//说明该in->buf数据已经全部发送出去
+            sent -= size;//标记后面还有多少数据是我发送过的
 
-            if (ngx_buf_in_memory(in->buf)) {
-                in->buf->pos = in->buf->last;
+            if (ngx_buf_in_memory(in->buf)) {//说明该in->buf数据已经全部发送出去
+                in->buf->pos = in->buf->last;//清空这段内存。继续找下一个
             }
 
-            if (in->buf->in_file) {
+            if (in->buf->in_file) {//如果是文件 那么清空文件这个节点
                 in->buf->file_pos = in->buf->file_last;
             }
 
             continue;
         }
-
+        //说明这个节点没有完全发送结束
         if (ngx_buf_in_memory(in->buf)) {
-            in->buf->pos += (size_t) sent;
+            in->buf->pos += (size_t) sent;//下一字节数据在in->buf->pos+send位置，下次从这个位置开始发送
         }
 
         if (in->buf->in_file) {
